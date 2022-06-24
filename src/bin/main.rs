@@ -4,7 +4,10 @@ use std::fmt;
 use std::error;
 use std::num::ParseIntError;
 
-type Program = [[u8;256];256];
+const WIDTH: usize = 80;
+const HEIGHT: usize = 30;
+
+type Playfield = [[i32;WIDTH];HEIGHT];
 
 #[derive(Clone,Copy)]
 enum Direction {
@@ -24,16 +27,16 @@ impl distributions::Distribution<Direction> for distributions::Standard {
 }
 
 struct State {
-    program: Program,
-    line: u8,
-    col: u8,
-    stack: Vec<u8>,
+    playfield: Playfield,
+    line: usize,
+    col: usize,
+    stack: Vec<i32>,
     dir: Direction,
     str_mode: bool
 }
 
 #[derive(Debug)]
-enum Error { SourceTooTall, SourceTooWide(usize), SourceNotAscii, NoArgs, ReadSourceFailed(io::Error), WriteFailed(io::Error), ParseIntFailed(ParseIntError) }
+enum Error { SourceTooTall, SourceTooWide(usize), NoArgs, ReadSourceFailed(io::Error), WriteFailed(io::Error), ParseIntFailed(ParseIntError) }
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -41,7 +44,6 @@ impl fmt::Display for Error {
         match self {
             SourceTooTall => write!(f, "program contains too many lines (> 256)"),
             SourceTooWide(i) => write!(f, "program contains too many columns (> 256) on line {}", i+1),
-            SourceNotAscii => write!(f, "program contains non-ascii characters"),
             NoArgs => write!(f, "no source file provided"),
             ReadSourceFailed(_) => write!(f, "failed to read source file"),
             WriteFailed(_) => write!(f, "failed to write to stdout"),
@@ -62,30 +64,28 @@ impl error::Error for Error {
     }
 }
 
-fn parse_program(source: &str) -> Result<Program,Error> {
+fn parse_program(source: &str) -> Result<Playfield,Error> {
     use Error::*;
 
-    if !source.is_ascii() { return Err(SourceNotAscii); }
-
     let lines: Vec<_> = source.split('\n').collect();
-    if lines.len() > 256 { return Err(SourceTooTall); }
+    if lines.len() > HEIGHT { return Err(SourceTooTall); }
 
-    let mut program = [[0;256];256];
+    let mut program = [[0;WIDTH];HEIGHT];
 
     for (i, line) in lines.iter().enumerate() {
-        let line_bytes = line.as_bytes();
-        let len = line_bytes.len();
-        if len > 256 { return Err(SourceTooWide(i)); }
-        program[i][0..len].copy_from_slice(line_bytes);
+        let chars: Vec<_> = line.chars().map(|c| c as i32).collect();
+        let len = chars.len();
+        if len > WIDTH { return Err(SourceTooWide(i)); }
+        program[i][0..len].copy_from_slice(&chars);
     }
 
     Ok(program)
 }
 
 impl State {
-    fn init(program: Program) -> Self {
+    fn init(playfield: Playfield) -> Self {
         State {
-            program,
+            playfield,
             line: 0,
             col: 0,
             stack: Vec::new(),
@@ -94,29 +94,35 @@ impl State {
         }
     }
 
-    fn pop(&mut self) -> u8 {
+    fn pop(&mut self) -> i32 {
         self.stack.pop().unwrap_or(0)
     }
 
-    fn push(&mut self, val: u8) {
+    fn push(&mut self, val: i32) {
         self.stack.push(val);
     }
 
     fn mov(&mut self) {
         use Direction::*;
         match self.dir {
-            Right => { self.col = self.col.wrapping_add(1); },
-            Left => { self.col = self.col.wrapping_sub(1); },
-            Up => { self.line = self.line.wrapping_sub(1); },
-            Down => { self.line = self.line.wrapping_add(1); }
+            Right => { self.col = if self.col == WIDTH { 0 } else { self.col + 1 }; },
+            Left => { self.col = if self.col == 0 { WIDTH } else { self.col - 1 }; },
+            Up => { self.line = if self.line == 0 { HEIGHT } else { self.line - 1 }; },
+            Down => { self.line = if self.col == HEIGHT { 0 } else { self.line + 1 }; }
         }
     }
+
+    fn at(&mut self, line: i32, col: i32) -> &mut i32 {
+        let line_wrap = usize::try_from(line.rem_euclid(HEIGHT as i32)).unwrap();
+        let col_wrap = usize::try_from(col.rem_euclid(HEIGHT as i32)).unwrap();
+        &mut self.playfield[line_wrap][col_wrap]
+    } 
     
     fn step(&mut self, stdin: &mut io::StdinLock, stdout: &mut io::StdoutLock) -> Result<bool,Error> {
         use Direction::*;
         use Error::*;
 
-        let instr = self.program[self.line as usize][self.col as usize];
+        let instr = self.playfield[self.line][self.col];
 
         if self.str_mode {
             if instr == 34 {
@@ -206,12 +212,13 @@ impl State {
                     let line = self.pop();
                     let col = self.pop();
                     let a = self.pop();
-                    self.program[line as usize][col as usize] = a;
+                    *self.at(line,col) = a;
                 },
                 103 => { // g
                     let line = self.pop();
                     let col = self.pop();
-                    self.push(self.program[line as usize][col as usize]);
+                    let val = *self.at(line,col);
+                    self.push(val);
                 },
                 64 => { // @
                     return Ok(false);
@@ -225,7 +232,7 @@ impl State {
                             break;
                         }
                     }
-                    self.push(buf[0]);
+                    self.push(buf[0] as i32);
                 },
                 38 => { // &
                     let mut buf = String::new();
@@ -236,17 +243,17 @@ impl State {
                             break;
                         }
                     }
-                    let big: u64 = buf.trim().parse().map_err(|e| {Error::ParseIntFailed(e)})?;
-                    self.push(big.to_le_bytes()[0]);
+                    let inp: i32 = buf.trim().parse().map_err(|e| {ParseIntFailed(e)})?;
+                    self.push(inp);
                 },
                 44 => { // ,
-                    stdout.write_all(&[self.pop()]).map_err(|e| {Error::WriteFailed(e)})?;
-                    stdout.flush().map_err(|e| {Error::WriteFailed(e)})?;
+                    stdout.write_all(&self.pop().to_ne_bytes()).map_err(|e| {WriteFailed(e)})?;
+                    stdout.flush().map_err(|e| {WriteFailed(e)})?;
                 },
                 46 => { // .
-                    stdout.write_all(self.pop().to_string().as_bytes()).map_err(|e| {Error::WriteFailed(e)})?;
-                    stdout.write_all(&[32]).map_err(|e| {Error::WriteFailed(e)})?;
-                    stdout.flush().map_err(|e| {Error::WriteFailed(e)})?;
+                    stdout.write_all(self.pop().to_string().as_bytes()).map_err(|e| {WriteFailed(e)})?;
+                    stdout.write_all(&[32]).map_err(|e| {WriteFailed(e)})?;
+                    stdout.flush().map_err(|e| {WriteFailed(e)})?;
                 },
                 _ => { }
             }
